@@ -9,3 +9,4 @@ class Config:
     SQLALCHEMY_DATABASE_URI = 'sqlite:///' + os.path.join(basedir, 'database.db')
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     JWT_SECRET_KEY = 'your-jwt-secret-key'
+    JWT_ACCESS_TOKEN_EXPIRES = False
