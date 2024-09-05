@@ -1,8 +1,6 @@
 from datetime import datetime
 import pytz
-import uuid
 from flask import Flask
-from flask_bcrypt import generate_password_hash
 from .extensions import db, jwt, migrate
 from .api import auth, tasks
 from .models import User, Task
@@ -18,6 +16,19 @@ def create_app():
 
     app.register_blueprint(auth.bp)
     app.register_blueprint(tasks.bp)
+
+
+
+    @app.after_request
+    def add_header(response):
+        """
+        Add headers to disable caching for every response.
+        """
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, post-check=0, pre-check=0, max-age=0'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '-1'
+        return response
+
 
     # Register the seed command
     @app.cli.command("seed")
@@ -53,9 +64,9 @@ def create_app():
             for user_data in users_data:
                 user = User(
                     username=user_data["username"],
-                    password=generate_password_hash(user_data["password"]),
                     timezone=user_data["timezone"]
                 )
+                user.set_password(user_data["password"])
                 users.append(user)
 
             db.session.add_all(users)
