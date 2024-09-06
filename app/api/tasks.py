@@ -1,120 +1,128 @@
-from calendar import monthrange
-from datetime import datetime, timedelta
-from flask import Blueprint, request, jsonify, make_response
+from datetime import timezone
+
+from flask import Blueprint, request, jsonify
 from app.models import Task, User
 from app.extensions import db
 from flask_jwt_extended import jwt_required, get_jwt_identity
-import pytz
+from datetime import datetime, timedelta, date
 
 bp = Blueprint('tasks', __name__, url_prefix='/tasks')
 
 
-# Utility function to convert UTC to user's timezone
-def convert_to_user_timezone(dt, user_timezone):
-    try:
-        if dt:
-            utc = pytz.utc
-            user_tz = pytz.timezone(user_timezone)
-            return dt.replace(tzinfo=utc).astimezone(user_tz)
-        return None
-    except pytz.UnknownTimeZoneError:
-        return None
-
-
-# Utility function to convert user's local time to UTC
-def convert_to_utc(dt, user_timezone):
-    try:
-        if dt:
-            user_tz = pytz.timezone(user_timezone)
-            return user_tz.localize(dt).astimezone(pytz.utc)
-        return None
-    except pytz.UnknownTimeZoneError:
-        return None
-
-
-# Helper function to convert task times from UTC to user's local timezone and format them
-def format_task_times(tasks, user_timezone):
-    formatted_tasks = []
-    for task in tasks:
-        task_dict = task.to_dict()
-        task_dict['start_time'] = convert_to_user_timezone(task.start_time, user_timezone).strftime('%Y-%m-%d %H:%M:%S')
-        if task.end_time:
-            task_dict['end_time'] = convert_to_user_timezone(task.end_time, user_timezone).strftime('%Y-%m-%d %H:%M:%S')
-        formatted_tasks.append(task_dict)
-    return formatted_tasks
-
-
-# Helper function to filter tasks by date range and convert from UTC to user's timezone
-def get_tasks_in_range(user, start_date, end_date):
-    tasks = Task.query.filter(Task.user_id == user.id, Task.start_time >= start_date, Task.end_time <= end_date) \
+# Pomoćna funkcija za filtriranje zadataka po datumskom opsegu
+def get_tasks_in_range(user, start_time, end_time):
+    tasks = Task.query.filter(Task.user_id == user.id, Task.start_time >= start_time, Task.end_time <= end_time) \
         .order_by(Task.start_time.asc()).all()
-    formatted_tasks = format_task_times(tasks, user.timezone)
-    response = jsonify(formatted_tasks)
-    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, post-check=0, pre-check=0, max-age=0'
-    response.headers['Pragma'] = 'no-cache'
-    response.headers['Expires'] = '-1'
-    return response
+    return tasks
 
 
-@bp.after_request
-def add_no_cache_headers(response):
-    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, post-check=0, pre-check=0, max-age=0'
-    response.headers['Pragma'] = 'no-cache'
-    response.headers['Expires'] = '-1'
-    return response
-
-
-# Route to get all tasks or filter by date range
+# Ruta za dobijanje svih zadataka ili filtriranje po id-u
 @bp.route('/', methods=['GET'])
 @jwt_required()
 def get_tasks():
     user_id = get_jwt_identity()
-    start_time = request.args.get('start_time')
-    end_time = request.args.get('end_time')
-
-    user = User.query.get(user_id)
-
-    if start_time and end_time:
-        try:
-            start_time = datetime.strptime(start_time, '%Y-%m-%d %H:%M:%S')
-            end_time = datetime.strptime(end_time, '%Y-%m-%d %H:%M:%S')
-            start_time = convert_to_utc(start_time, user.timezone)
-            end_time = convert_to_utc(end_time, user.timezone)
-        except ValueError:
-            response = jsonify({'error': 'Invalid datetime format. Use YYYY-MM-DD HH:MM:SS'})
-            return response, 400
-
-        return get_tasks_in_range(user, start_time, end_time)
-
-    tasks = Task.query.filter_by(user_id=user_id).order_by(Task.start_time.asc()).all()
-    formatted_tasks = format_task_times(tasks, user.timezone)
-
-    response = jsonify(formatted_tasks)
-    return response
+    task_id = request.args.get('id')
+    if task_id is not None:
+        task = Task.query.get(task_id)
+        if task is None or task.user_id != user_id:
+            return jsonify({'error': 'Task not found or access denied.'}), 404
+        tasks_json = task.to_dict()
+    else:
+        tasks = Task.query.filter_by(user_id=user_id).order_by(Task.start_time.asc()).all()
+        tasks_json = [task.to_dict() for task in tasks]
+    return jsonify(tasks_json)
 
 
-# Get tasks for a specific day or today if not provided
+# Dobijanje zadataka za određeni dan ili za tekući dan ako nije naveden
 @bp.route('/daily', methods=['GET'])
 @jwt_required()
 def get_daily_tasks():
     user_id = get_jwt_identity()
     date_param = request.args.get('date')
-
     user = User.query.get(user_id)
 
     if date_param:
-        day = datetime.strptime(date_param, '%Y-%m-%d').date()
+        start_of_day = f"{date_param} 00:00:00"
+        end_of_day = f"{date_param} 23:59:59"
     else:
-        day = datetime.utcnow().date()
+        current_date = datetime.today().strftime('%Y-%m-%d')
+        start_of_day = f"{current_date} 00:00:00"
+        end_of_day = f"{current_date} 23:59:59"
 
-    start_of_day = convert_to_utc(datetime.combine(day, datetime.min.time()), user.timezone)
-    end_of_day = convert_to_utc(datetime.combine(day, datetime.max.time()), user.timezone)
+    task_list = Task.query.filter(Task.user_id == user.id, Task.start_time >= start_of_day, Task.end_time <= end_of_day)
 
-    response = get_tasks_in_range(user, start_of_day, end_of_day)
-    return response
+    task_dict = [task.to_dict() for task in task_list]
+    return jsonify(task_dict)
 
 
-# Create a task with timezone handling
+# Dobijanje zadataka za tekuću nedelju
+@bp.route('/weekly', methods=['GET'])
+@jwt_required()
+def get_weekly_tasks():
+    user_id = get_jwt_identity()
+    user = User.query.get(user_id)
+    date_str = request.args.get('date')
+    if date_str is None:
+        date_str = datetime.now().strftime('%Y-%m-%d')
+    try:
+        start_date = datetime.strptime(date_str, '%Y-%m-%d')
+    except ValueError:
+        return jsonify({'error': 'Invalid date format. Use YYYY-MM-DD'}), 400
+
+    start_of_week = start_date - timedelta(days=start_date.weekday())
+    end_of_week = start_of_week + timedelta(days=6)
+
+    tasks = get_tasks_in_range(user, start_of_week, end_of_week)
+    tasks_json = [task.to_dict() for task in tasks]
+    return jsonify(tasks_json), 200
+
+
+# Dobijanje zadataka za tekući mesec
+@bp.route('monthly', methods=['GET'])
+@jwt_required()
+def get_monthly_tasks():
+    user_id = get_jwt_identity()
+    user = User.query.get(user_id)
+    data_str = request.args.get('date')
+
+    if data_str:
+        start_of_month = datetime.strptime(data_str, '%Y-%m-%d').replace(day=1)
+    else:
+        start_of_month = datetime.today().replace(day=1)
+
+    next_month = start_of_month.replace(day=28) + timedelta(days=4)  # ovo nikada neće zakačiti
+    end_of_month = next_month - timedelta(days=next_month.day)
+
+    tasks = get_tasks_in_range(user, start_of_month, end_of_month)
+    tasks_json = [task.to_dict() for task in tasks]
+    return jsonify(tasks_json), 200
+
+
+# Dobijanje zadataka za određeni vremenski opseg
+@bp.route('/range', methods=['GET'])
+@jwt_required()
+def tasks_in_range():
+    user_id = get_jwt_identity()
+    start_time = request.args.get('start_time')
+    end_time = request.args.get('end_time')
+
+    if not start_time or not end_time:
+        return jsonify({'error': 'Both start_time and end_time are required.'}), 400
+
+    try:
+        start_time = datetime.fromisoformat(start_time)
+        end_time = datetime.fromisoformat(end_time)
+    except ValueError:
+        return jsonify({'error': 'Invalid datetime format. Use YYYY-MM-DD HH:MM:SS'}), 400
+
+    user = User.query.get_or_404(user_id)
+    tasks = get_tasks_in_range(user, start_time, end_time)
+
+    tasks_json = [task.to_dict() for task in tasks]
+    return jsonify(tasks_json), 200
+
+
+# Kreiranje zadatka
 @bp.route('/', methods=['POST'])
 @jwt_required()
 def create_task():
@@ -123,50 +131,48 @@ def create_task():
         response = jsonify({'error': 'Title and start_time are required.'})
         return response, 400
 
-    user_id = get_jwt_identity()
-    user = User.query.get(user_id)
-
     try:
-        start_time = datetime.strptime(data['start_time'], '%Y-%m-%d %H:%M:%S')
-        start_time = convert_to_utc(start_time, user.timezone)
-        end_time = None
-        if 'end_time' in data:
-            end_time = datetime.strptime(data['end_time'], '%Y-%m-%d %H:%M:%S')
-            end_time = convert_to_utc(end_time, user.timezone)
-        task = Task(
-            title=data['title'],
-            user_id=user_id,
-            start_time=start_time,
-            end_time=end_time
-        )
-        db.session.add(task)
-        db.session.commit()
-        response = jsonify({'message': 'Task created successfully'})
-        return response, 201
+        start_time = datetime.fromisoformat(data['start_time'])
+        end_time = datetime.fromisoformat(data['end_time']) if 'end_time' in data else None
     except ValueError:
-        response = jsonify({'error': 'Invalid datetime format. Use YYYY-MM-DD HH:MM:SS'})
-        return response, 400
+        return jsonify({'error': 'Invalid datetime format. Use YYYY-MM-DD HH:MM:SS'}), 400
+
+    user_id = get_jwt_identity()
+
+    task = Task(
+        title=data['title'],
+        tag=data['tag'],
+        user_id=user_id,
+        body=data.get('body'),
+        start_time=start_time,
+        end_time=end_time
+    )
+    db.session.add(task)
+    db.session.commit()
+    return jsonify(task.to_dict()), 201
 
 
-# Update a task and handle timezone conversion
-@bp.route('/<string:id>', methods=['PUT'])
+# Ažuriranje zadatka
+@bp.route('/', methods=['PUT'])
 @jwt_required()
-def update_task(id):
+def update_task():
+    id = request.args.get('id')
     task = Task.query.get_or_404(id)
     data = request.get_json()
     if 'title' in data:
         task.title = data['title']
     db.session.commit()
-    response = jsonify({'message': 'Task updated successfully'})
-    return response
+
+    task.query.get_or_404(id)
+    return jsonify(task.to_dict())
 
 
-# Delete a task
-@bp.route('/<string:id>', methods=['DELETE'])
+# Brisanje zadatka
+@bp.route('/', methods=['DELETE'])
 @jwt_required()
-def delete_task(id):
+def delete_task():
+    id = request.args.get('id')
     task = Task.query.get_or_404(id)
     db.session.delete(task)
     db.session.commit()
-    response = jsonify({'message': 'Task deleted successfully'})
-    return response
+    return jsonify({'message': 'Task deleted successfully'})
